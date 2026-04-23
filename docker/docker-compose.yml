@@ -1,0 +1,25 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: pubrecsearch-postgres
+    environment:
+      POSTGRES_USER: pubrecsearch
+      POSTGRES_PASSWORD: changeme
+      POSTGRES_DB: pubrecsearch
+    volumes:
+      # Persistent data — survives container restarts and recreates
+      - postgres_data:/var/lib/postgresql/data
+      # Schema is applied automatically on first container creation
+      - ../db/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pubrecsearch -d pubrecsearch"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:
+    name: pubrecsearch_postgres_data

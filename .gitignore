@@ -1,0 +1,81 @@
+# Environment & secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+develop-eggs/
+.installed.cfg
+lib/
+lib64/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Pytest / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# Ruff / linters
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Temp files created by scrapers during large-file parsing
+/tmp/
+*.tmp
+
+# PostgreSQL dumps
+*.dump
+*.sql.gz
+
+# Large data files — never commit raw scrape data
+*.zip
+*.csv
+*.json.gz
+*.xml.gz
+# Exception: keep small fixture/test files
+!tests/fixtures/**
+
+# Logs
+*.log
+logs/
+
+# Bootstrap checkpoint state (local only)
+scripts/bootstrap/.state/
