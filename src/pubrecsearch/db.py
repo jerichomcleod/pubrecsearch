@@ -146,7 +146,14 @@ def insert_document(
     doc_type: str,
     period: str,
 ) -> int:
-    """Insert a document row and return its id."""
+    """Insert a document row and return its id.
+
+    Uses ON CONFLICT (r2_key) DO UPDATE so that re-runs against the same R2 path
+    (e.g. FEC's rolling cycle file indiv26.zip) update the metadata row rather than
+    raising a UniqueViolation. The existing doc_id is preserved, which means
+    individual_documents links from the previous ingest remain valid and new
+    individual_documents rows (ON CONFLICT DO NOTHING) are appended incrementally.
+    """
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -154,6 +161,11 @@ def insert_document(
                 INSERT INTO documents
                     (r2_key, source_id, source_url, captured_at, file_hash, file_size, doc_type, period)
                 VALUES (%s, %s, %s, now(), %s, %s, %s, %s)
+                ON CONFLICT (r2_key) DO UPDATE SET
+                    file_hash  = EXCLUDED.file_hash,
+                    file_size  = EXCLUDED.file_size,
+                    captured_at = EXCLUDED.captured_at,
+                    source_url = EXCLUDED.source_url
                 RETURNING id
                 """,
                 (r2_key, source_id, source_url, file_hash, file_size, doc_type, period),

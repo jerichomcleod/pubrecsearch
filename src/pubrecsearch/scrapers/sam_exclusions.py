@@ -56,7 +56,10 @@ _MAX_POLL_SECONDS = 300   # 5 minutes
 
 def _is_retryable(exc: BaseException) -> bool:
     if isinstance(exc, httpx.HTTPStatusError):
-        return exc.response.status_code in (429, 500, 502, 503, 504)
+        # 429 is intentionally excluded: SAM.gov is rate-limited to 10 requests/day.
+        # Retrying on 429 burns the remaining daily budget without any chance of success.
+        # The scheduler will retry tomorrow when the quota resets.
+        return exc.response.status_code in (500, 502, 503, 504)
     return isinstance(exc, (httpx.TimeoutException, httpx.NetworkError))
 
 

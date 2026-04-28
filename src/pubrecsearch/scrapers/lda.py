@@ -81,6 +81,7 @@ class LdaScraper(BaseScraper):
 
         all_results: list[dict] = []
         # First request uses query params; subsequent requests use the full 'next' URL
+        # returned by the API (which already encodes all filter params).
         next_url: str | None = _FILINGS_URL
         first = True
 
@@ -89,11 +90,17 @@ class LdaScraper(BaseScraper):
                 if first:
                     params = {"received_dt__gte": since, "page_size": _PAGE_SIZE}
                     resp = client.get(next_url, params=params)
+                    resp.raise_for_status()
                     first = False
                 else:
                     resp = client.get(next_url)
+                    # The LDA API occasionally returns 400 on deeper paginated pages
+                    # when using date-range filters. Treat this as end-of-results rather
+                    # than a hard failure so we keep whatever we've already collected.
+                    if resp.status_code == 400:
+                        break
+                    resp.raise_for_status()
 
-                resp.raise_for_status()
                 data = resp.json()
                 all_results.extend(data.get("results") or [])
                 next_url = data.get("next")  # None on last page

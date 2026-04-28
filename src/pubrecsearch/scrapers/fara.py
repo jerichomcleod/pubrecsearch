@@ -32,7 +32,9 @@ from ..models import DownloadTarget, ParsedIndividual, ParsedRecord
 from ..normalize import normalize_name
 
 _REGISTRANTS_URL = "https://efile.fara.gov/bulk/zip/FARA_All_Registrants.csv.zip"
-_SHORT_FORM_URL = "https://efile.fara.gov/bulk/zip/FARA_All_Short_Form.csv.zip"
+# NSD-6 short-form / individual employee data. FARA renamed this file; the old
+# FARA_All_Short_Form.csv.zip path returns 404 as of 2026.
+_SHORT_FORM_URL = "https://efile.fara.gov/bulk/zip/FARA_All_RegistrantContacts.csv.zip"
 _HEADERS = {"User-Agent": "PubRecSearch/1.0 (research@example.com)"}
 
 
@@ -190,21 +192,26 @@ def _parse_registrants(raw: bytes) -> list[ParsedRecord]:
 
 
 def _parse_short_form(raw: bytes) -> list[ParsedRecord]:
-    """Extract individual filers from FARA_All_Short_Form.csv (NSD-6)."""
+    """Extract individual filers from FARA_All_RegistrantContacts.csv (formerly Short_Form/NSD-6).
+
+    FARA renamed the file to RegistrantContacts in 2026. Column names changed too,
+    so we probe both old Short_Form names and new RegistrantContacts names.
+    """
     try:
         csv_bytes = _extract_csv(raw)
         df = _read_fara_csv(csv_bytes)
     except Exception as exc:
         raise ValueError(f"FARA short form parse error: {exc}") from exc
 
-    # Short form column names — FARA uses various naming conventions
-    # Try split first/last name columns first, fall back to full name
-    first_col = _col(df, "FirstName", "first_name", "FilerFirstName")
-    last_col = _col(df, "LastName", "last_name", "FilerLastName")
-    name_col = _col(df, "Name", "FilerName", "FullName", "filer_name")
+    # Try split first/last name columns first, fall back to full name.
+    # RegistrantContacts schema uses ContactFirstName/ContactLastName;
+    # old Short_Form schema used FirstName/LastName or FilerFirstName/FilerLastName.
+    first_col = _col(df, "ContactFirstName", "FirstName", "first_name", "FilerFirstName")
+    last_col = _col(df, "ContactLastName", "LastName", "last_name", "FilerLastName")
+    name_col = _col(df, "ContactName", "Name", "FilerName", "FullName", "filer_name")
     reg_id_col = _col(df, "RegistrantID", "registrant_id", "RegID")
     reg_name_col = _col(df, "RegistrantName", "registrant_name", "OrgName")
-    date_col = _col(df, "DateStamp", "date_stamp", "RegistrationDate", "FilingDate")
+    date_col = _col(df, "DateStamp", "date_stamp", "RegistrationDate", "FilingDate", "ContactDate")
     country_col = _col(df, "Country", "country", "ForeignPrincipalCountry")
     address_col = _col(df, "Address", "address")
     city_col = _col(df, "City", "city")
