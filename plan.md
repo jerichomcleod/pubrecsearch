@@ -1168,7 +1168,37 @@ Before writing code for these sources, make one manual request to verify access:
 
 ---
 
-## 12. Python Dependencies
+## 12. Future Refactoring — Richer Data Extraction
+
+**Status: deferred until all scrapers complete. Note these requirements before starting Phase 4.**
+
+### 1. Widen the data model — store more exhaustive field data
+
+Current scrapers capture a curated subset of source fields (name, a few identifiers, a text excerpt). This is intentional for speed during the initial build, but the data model needs to be broadened:
+
+- **Store all available structured fields** from each source in `identifiers` JSONB, not just the handful currently captured. For example: FEC contributions should include the full `cmte_id`, `transaction_dt`, `zip_code`, `employer`, `occupation`, `transaction_amt`, `sub_id` — not just a subset. LDA filings should include all activity codes, covered government entities per lobbyist, client list, etc.
+- **Excerpt should be machine-readable** where possible, not just a human-readable string. Consider storing a structured summary dict in `identifiers` alongside the free-text `excerpt`, so the search API can filter/facet on it.
+- This is a **data enrichment pass**, not a schema migration — the current schema can already hold all of this in `identifiers` JSONB; it's a parser change only.
+
+### 2. Separate the download step from the extraction step
+
+Current architecture conflates download → parse → insert in a single runner pass. This limits flexibility:
+
+- **Proposed split:** `download` (fetch raw file, upload to R2, record document row) runs on the scraper's cron schedule. `extract` (parse R2 file, insert individuals) runs as a separate step that can be re-run without re-downloading.
+- This is critical for large files (CMS 9 GB, FEC 20 GB): if the parser logic changes, today you must re-download to re-parse. With a split architecture, re-extraction is cheap (read from R2).
+- The `documents` table already records every R2 key — the extraction step just needs a way to identify which documents have been extracted (a `last_extracted_at` column or a separate `extraction_jobs` table).
+- Bootstrap scripts already approximate this pattern (download year → insert separately). Formalize it.
+
+### 3. Implementation approach (when ready)
+
+1. Add `last_extracted_at TIMESTAMPTZ` column to `documents` table (nullable; NULL = not yet extracted or needs re-extraction).
+2. Refactor runner: `_fetch_and_store_document()` is Step 1 (download only); a new `_extract_document()` is Step 2.
+3. Add a `pubrecsearch extract [--source X] [--since DATE] [--force]` CLI command that re-runs extraction on already-downloaded documents.
+4. Update each scraper's `parse()` / `parse_to_db()` to capture all available fields.
+
+---
+
+## 13. Python Dependencies
 
 ```
 httpx             # async HTTP client

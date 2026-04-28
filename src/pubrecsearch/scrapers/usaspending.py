@@ -96,7 +96,14 @@ class UsaspendingScraper(BaseScraper):
         payload = {
             "filters": {
                 "recipient_type_names": ["Individual"],
-                "time_period": [{"start_date": start_date, "end_date": end_date}],
+                # API requires date_range (not time_period) and at least one award type
+                "date_range": {"start_date": start_date, "end_date": end_date},
+                "prime_award_types": [
+                    # Contracts
+                    "A", "B", "C", "D",
+                    # Financial assistance: grants, loans, direct payments
+                    "02", "03", "04", "05", "06", "07", "08", "09", "10", "11",
+                ],
             },
             "award_levels": ["prime_awards"],
             "columns": [],

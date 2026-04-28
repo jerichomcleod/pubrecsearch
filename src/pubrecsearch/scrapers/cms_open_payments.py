@@ -23,6 +23,7 @@ import shutil
 import tempfile
 import zipfile
 from datetime import date
+from pathlib import Path
 
 import httpx
 import polars as pl
@@ -56,29 +57,49 @@ _PHYSICIAN_COLS = [
 
 
 def _find_general_payments_url(datasets: list[dict]) -> tuple[str, str] | None:
-    """Scan dataset metadata to find the latest General Payments bulk download."""
+    """Scan dataset list metadata to find the latest General Payments dataset.
+
+    The CMS list endpoint omits distribution URLs; we must fetch each dataset
+    record individually by identifier to get the real downloadURL.
+    """
+    # Collect (year, identifier) for all "General Payment Data" entries
     candidates = []
     for ds in datasets:
-        title = (ds.get("title") or "").lower()
-        if "general payment" in title and "detail" in title:
-            # Extract program year from title (e.g. "2023")
-            for word in (ds.get("title") or "").split():
-                if word.isdigit() and 2013 <= int(word) <= date.today().year:
-                    year = int(word)
-                    # Find download URL
-                    for dist in (ds.get("distribution") or []):
-                        if dist.get("mediaType") in ("text/csv", "application/zip"):
-                            dl_url = dist.get("downloadURL") or dist.get("accessURL")
-                            if dl_url:
-                                candidates.append((year, dl_url))
-                    break
+        title = ds.get("title") or ""
+        if "general payment" not in title.lower():
+            continue
+        for word in title.split():
+            if word.isdigit() and 2013 <= int(word) <= date.today().year:
+                identifier = ds.get("identifier")
+                if identifier:
+                    candidates.append((int(word), identifier))
+                break
 
     if not candidates:
         return None
-    # Return the most recent year
+
     candidates.sort(key=lambda x: x[0], reverse=True)
-    year, url = candidates[0]
-    return url, str(year)
+
+    # Fetch the full record for the most recent year to get the download URL
+    _DETAIL_URL = "https://openpaymentsdata.cms.gov/api/1/metastore/schemas/dataset/items/{identifier}"
+    headers = {"User-Agent": "PubRecSearch/1.0 (research@example.com)"}
+    for year, identifier in candidates:
+        try:
+            with make_client(timeout=30, headers=headers) as client:
+                resp = client.get(_DETAIL_URL.format(identifier=identifier))
+                resp.raise_for_status()
+                record = resp.json()
+            for dist in record.get("distribution") or []:
+                dl_url = dist.get("downloadURL") or dist.get("accessURL")
+                media = (dist.get("mediaType") or "").lower()
+                title_d = (dist.get("title") or "").lower()
+                # Prefer the "detailed dataset" general payment CSV
+                if dl_url and ("general" in title_d or "csv" in media or "zip" in media):
+                    return dl_url, str(year)
+        except Exception:
+            continue
+
+    return None
 
 
 class CmsOpenPaymentsScraper(BaseScraper):
@@ -99,15 +120,8 @@ class CmsOpenPaymentsScraper(BaseScraper):
 
         result = _find_general_payments_url(datasets)
         if not result:
-            # Fallback: use a known stable URL pattern for the most recent year
-            year = date.today().year - 1  # CMS publishes prior year ~June
-            period = str(year)
-            # CMS stable URL pattern (may need updating annually)
-            url = (
-                f"https://download.cms.gov/openpayments/PGYR{str(year)[2:]}_P06282024.ZIP"
-            )
-        else:
-            url, period = result
+            return []  # No dataset found — skip until next scheduled run
+        url, period = result
 
         if last_period == period:
             return []
@@ -123,18 +137,39 @@ class CmsOpenPaymentsScraper(BaseScraper):
             )
         ]
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=5, max=120), reraise=True)
     def fetch(self, target: DownloadTarget) -> bytes:
-        with make_client(timeout=600, headers=_HEADERS) as client:
-            resp = client.get(target.url)
-            resp.raise_for_status()
-            return resp.content
+        """Not used — fetch_to_file() handles the streaming download."""
+        raise NotImplementedError("CMS uses fetch_to_file() streaming path")
 
-    def parse_to_db(self, raw: bytes, target: DownloadTarget, doc_id: int) -> tuple[int, int]:
-        """Bulk-insert CMS physician payments using PostgreSQL COPY."""
-        tmp_dir = tempfile.mkdtemp()
+    @retry(stop=stop_after_attempt(2), wait=wait_exponential(min=10, max=120), reraise=True)
+    def fetch_to_file(self, target: DownloadTarget) -> Path:
+        """Stream the CMS CSV directly to a temp file (avoids loading 9 GB into RAM)."""
+        tmp_dir = Path(tempfile.mkdtemp())
+        dest = tmp_dir / target.filename
+        with make_client(timeout=7200, headers=_HEADERS) as client:
+            with client.stream("GET", target.url) as resp:
+                resp.raise_for_status()
+                with open(dest, "wb") as f:
+                    for chunk in resp.iter_bytes(chunk_size=8 * 1024 * 1024):
+                        f.write(chunk)
+        return dest
+
+    def parse_to_db(self, raw: bytes | None, target: DownloadTarget, doc_id: int) -> tuple[int, int]:
+        """Bulk-insert CMS physician payments using PostgreSQL COPY.
+
+        raw is None when the streaming fetch_to_file() path was used;
+        the file path is in target.metadata["_local_path"].
+        """
+        local_path = target.metadata.get("_local_path")
+        if local_path:
+            csv_path = _prepare_csv_from_path(Path(local_path))
+            _tmp_dir = None
+        else:
+            assert raw is not None
+            _tmp_dir = tempfile.mkdtemp()
+            csv_path = _extract_csv(raw, _tmp_dir)
+
         try:
-            csv_path = _extract_csv(raw, tmp_dir)
             rows = _build_cms_rows(csv_path, target)
             if not rows:
                 return 0, 0
@@ -142,11 +177,23 @@ class CmsOpenPaymentsScraper(BaseScraper):
                 inserted, total = bulk_insert_individuals(conn, doc_id, "cms_payment_recipient", rows)
             return total, inserted
         finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+            if _tmp_dir:
+                shutil.rmtree(_tmp_dir, ignore_errors=True)
 
     def parse(self, raw: bytes, target: DownloadTarget) -> list[ParsedRecord]:
         """Fallback parse — not used (parse_to_db takes priority)."""
         return []
+
+
+def _prepare_csv_from_path(path: Path) -> str:
+    """Return the CSV path for a file already on disk (no extraction needed for plain CSV)."""
+    # If it's a ZIP, extract into the same directory
+    if path.suffix.lower() == ".zip":
+        tmp_dir = str(path.parent)
+        with open(path, "rb") as f:
+            return _extract_csv(f.read(), tmp_dir)
+    # Already a plain CSV
+    return str(path)
 
 
 def _extract_csv(raw: bytes, tmp_dir: str) -> str:
@@ -255,6 +302,10 @@ def _parse_cms_csv(path: str, target: DownloadTarget) -> list[ParsedRecord]:
         first = (row.get(first_name_col) or "").strip() if first_name_col else ""
         mid = (row.get(mid_name_col) or "").strip() if mid_name_col else ""
         name = " ".join(p for p in [first, mid, last] if p)
+
+        # Skip placeholder names that normalize to empty (e.g. ". .", ".", " ")
+        if not normalize_name(name):
+            continue
 
         profile_id = (row.get(profile_id_col) or "").strip() if profile_id_col else ""
         npi = (row.get(npi_col) or "").strip() if npi_col else ""

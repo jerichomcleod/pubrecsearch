@@ -6,12 +6,24 @@ The ScraperRunner handles all cross-cutting concerns:
   - individual + individual_documents insertion
   - per-target error handling per the policy in implementation_plan.md §5
 
+Large-file streaming pattern (scrapers > ~1 GB):
+  If a scraper defines `fetch_to_file(target) -> Path`, the runner uses a
+  streaming path that avoids loading the full file into memory:
+    1. Scraper streams download to a temp file
+    2. Runner hashes the file incrementally (no full-read into RAM)
+    3. Runner uploads via r2.upload_fileobj (streaming multipart to R2)
+    4. Runner calls parse_to_db(raw=None, ...) — scraper reads from the
+       temp path stored in target.metadata["_local_path"]
+
 Usage:
   runner = ScraperRunner(OfacSdnScraper())
   runner.run()
 """
 
+import hashlib
 import json
+import os
+from pathlib import Path
 from typing import Any
 
 import tenacity
@@ -69,7 +81,10 @@ class ScraperRunner:
 
             # Large sources (FEC, CMS, etc.) implement parse_to_db() for
             # bulk COPY performance — call it instead of per-row parse().
+            # When using the streaming fetch_to_file() path, raw is None and
+            # the scraper reads from target.metadata["_local_path"] instead.
             if hasattr(self.scraper, "parse_to_db"):
+                local_path_str = target.metadata.get("_local_path")
                 try:
                     processed, new = self.scraper.parse_to_db(raw, target, doc_id)
                     records_processed += processed
@@ -88,6 +103,13 @@ class ScraperRunner:
                     db.log_error(
                         job_id, "critical", f"bulk parse failed: {target.url}", {"error": str(exc)}
                     )
+                finally:
+                    # Clean up temp file from streaming fetch_to_file() path
+                    if local_path_str:
+                        try:
+                            os.unlink(local_path_str)
+                        except Exception:
+                            pass
                 continue
 
             try:
@@ -156,22 +178,54 @@ class ScraperRunner:
 
     def _fetch_and_store_document(
         self, target: DownloadTarget, job_id: int
-    ) -> tuple[bytes, str, int, bool]:
-        """Fetch raw bytes, upload to R2, insert document row.
+    ) -> tuple[bytes | None, str, int, bool]:
+        """Fetch raw bytes (or stream to file), upload to R2, insert document row.
 
-        Returns (raw, file_hash, document_id, is_new).
+        Returns (raw_or_None, file_hash, document_id, is_new).
+        When the scraper implements fetch_to_file(), raw is None and
+        target.metadata["_local_path"] holds the temp file path.
         Raises _SkipTarget if the file is unchanged (ETag / hash match).
         Raises on R2 or DB failure.
         """
+        key = r2.r2_key(target.source_id, target.period, target.filename)
+        content_type = r2.CONTENT_TYPES.get(target.doc_type, "application/octet-stream")
+
+        if hasattr(self.scraper, "fetch_to_file"):
+            # Streaming path: scraper writes to temp file, we hash+upload without
+            # loading the full file into RAM.
+            local_path: Path = self._fetch_to_file_with_retry(target)
+            target.metadata["_local_path"] = str(local_path)
+
+            file_hash = _hash_file(local_path)
+            file_size = local_path.stat().st_size
+
+            if db.document_exists(file_hash):
+                try:
+                    local_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                raise _SkipTarget()
+
+            with open(local_path, "rb") as fobj:
+                self._upload_fileobj_with_retry(key, fobj, content_type)
+
+            doc_id = db.insert_document(
+                r2_key=key,
+                source_id=target.source_id,
+                source_url=target.url,
+                file_hash=file_hash,
+                file_size=file_size,
+                doc_type=target.doc_type,
+                period=target.period,
+            )
+            return None, file_hash, doc_id, True
+
+        # Standard in-memory path
         raw = self._fetch_with_retry(target)
         file_hash = db.sha256(raw)
 
-        # Skip if we've already processed this exact file content
         if db.document_exists(file_hash):
             raise _SkipTarget()
-
-        key = r2.r2_key(target.source_id, target.period, target.filename)
-        content_type = r2.CONTENT_TYPES.get(target.doc_type, "application/octet-stream")
 
         self._upload_with_retry(key, raw, content_type)
 
@@ -196,12 +250,29 @@ class ScraperRunner:
         return self.scraper.fetch(target)
 
     @retry(
+        stop=stop_after_attempt(2),
+        wait=wait_exponential(multiplier=1, min=5, max=60),
+        retry=tenacity.retry_if_exception_type(Exception),
+        reraise=True,
+    )
+    def _fetch_to_file_with_retry(self, target: DownloadTarget) -> Path:
+        return self.scraper.fetch_to_file(target)
+
+    @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=30),
         reraise=True,
     )
     def _upload_with_retry(self, key: str, data: bytes, content_type: str) -> None:
         r2.upload(key, data, content_type)
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=5, max=120),
+        reraise=True,
+    )
+    def _upload_fileobj_with_retry(self, key: str, fileobj, content_type: str) -> None:
+        r2.upload_fileobj(key, fileobj, content_type)
 
     def _write_record(self, record: ParsedRecord, doc_id: int) -> int:
         """Insert individual rows and linkages. Returns count of new individuals."""
@@ -218,6 +289,18 @@ class ScraperRunner:
             )
             count += 1
         return count
+
+
+def _hash_file(path: Path, chunk: int = 8 * 1024 * 1024) -> str:
+    """Compute SHA-256 of a file without loading it fully into memory."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            block = f.read(chunk)
+            if not block:
+                break
+            h.update(block)
+    return h.hexdigest()
 
 
 class _SkipTarget(Exception):

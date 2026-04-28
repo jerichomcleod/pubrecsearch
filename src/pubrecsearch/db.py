@@ -230,6 +230,12 @@ def bulk_insert_individuals(
     if not rows:
         return 0, 0
 
+    # Drop rows with empty name_norm — normalize_name() can return "" for
+    # placeholder values like ". ." that appear in some government datasets.
+    rows = [r for r in rows if (r.get("name_norm") or "").strip()]
+    if not rows:
+        return 0, 0
+
     # Build TSV buffer: name \\t name_norm \\t excerpt \\t identifiers_json
     buf = io.StringIO()
     for r in rows:

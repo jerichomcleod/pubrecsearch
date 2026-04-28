@@ -28,6 +28,7 @@ This uses only 2 API calls per run — well within the 10/day limit.
 Individual filtering happens in parse() via the Classification column.
 """
 
+import gzip
 import io
 import re
 import time
@@ -66,6 +67,9 @@ class SamExclusionsScraper(BaseScraper):
 
     def discover(self, state: dict) -> list[DownloadTarget]:
         today = date.today().isoformat()
+        # Skip if we already imported today's extract (rate limit is 10 calls/day)
+        if state.get("cursor") == today:
+            return []
         return [
             DownloadTarget(
                 url=_BASE_URL,
@@ -150,6 +154,11 @@ class SamExclusionsScraper(BaseScraper):
 
     def parse(self, raw: bytes, target: DownloadTarget) -> list[ParsedRecord]:
         """Parse the CSV extract, filter to individuals."""
+        # SAM.gov returns the extract as a raw gzip file (not via Content-Encoding),
+        # so httpx does not auto-decompress it. Detect and unwrap before decoding.
+        if raw[:2] == b"\x1f\x8b":
+            raw = gzip.decompress(raw)
+
         try:
             text = raw.decode("utf-8-sig")   # handle BOM
         except UnicodeDecodeError:

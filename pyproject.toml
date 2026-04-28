@@ -25,6 +25,7 @@ dependencies = [
     "pydantic-settings>=2.0",
     "click>=8.1",
     "truststore>=0.9",
+    "curl_cffi>=0.7",
 ]
 
 [project.optional-dependencies]
